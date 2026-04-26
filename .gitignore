@@ -10,4 +10,5 @@ build/
 data/
 *.sqlite
 *.sqlite-journal
-keystore/
+*_share.enc
+.ai-agent-wallet/
