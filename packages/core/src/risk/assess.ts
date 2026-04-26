@@ -29,10 +29,10 @@ export async function assessRisk(client: ChainClient, tx: ProposedTx, from: EthA
 
   return {
     recipient,
-    erc20,
+    ...(erc20 !== undefined ? { erc20 } : {}),
     simulation: sim.ok
       ? { ok: true, gasUsed: sim.gasUsed }
       : { ok: false, revertReason: sim.revertReason },
     flags,
-  };
+  } as RiskReport;
 }

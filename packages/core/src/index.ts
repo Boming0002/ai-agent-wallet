@@ -1,2 +1,22 @@
 // packages/core/src/index.ts
 export * from "./types.js";
+export * from "./storage/paths.js";
+export * from "./storage/db.js";
+export * from "./storage/keystore-file.js";
+export * from "./audit/hash-chain.js";
+export * from "./audit/log.js";
+export * from "./keystore/address.js";
+export * from "./keystore/shamir.js";
+export { generateWallet, addressFromShares, signWithShares } from "./keystore/keystore.js";
+export type { Wallet as KeystoreWallet, Signature } from "./keystore/keystore.js";
+export * from "./policy/schema.js";
+export * from "./policy/store.js";
+export * from "./policy/engine.js";
+export * from "./chain/client.js";
+export * from "./chain/simulate.js";
+export * from "./risk/recipient.js";
+export * from "./risk/erc20.js";
+export * from "./risk/assess.js";
+export * from "./approval/queue.js";
+export * from "./approval/states.js";
+export * from "./wallet.js";
