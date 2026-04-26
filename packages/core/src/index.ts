@@ -19,4 +19,7 @@ export * from "./risk/erc20.js";
 export * from "./risk/assess.js";
 export * from "./approval/queue.js";
 export * from "./approval/states.js";
+export * from "./pact/schema.js";
+export * from "./pact/manager.js";
+export * from "./pact/intersect.js";
 export * from "./wallet.js";

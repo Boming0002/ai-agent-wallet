@@ -15,6 +15,7 @@ export interface EnqueueArgs {
   policyVerdict: PolicyVerdict;
   riskReport: RiskReport;
   ttlMs: number;
+  pactId?: string;
 }
 
 export class PendingQueue {
@@ -25,8 +26,8 @@ export class PendingQueue {
     const created = this.now();
     const expires = created + args.ttlMs;
     this.db.prepare(`
-      INSERT INTO pending_ops(id, status, tx_json, policy_verdict_json, risk_report_json, created_at, expires_at)
-      VALUES (?, 'pending', ?, ?, ?, ?, ?)
+      INSERT INTO pending_ops(id, status, tx_json, policy_verdict_json, risk_report_json, created_at, expires_at, pact_id)
+      VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       JSON.stringify(args.tx),
@@ -34,17 +35,19 @@ export class PendingQueue {
       JSON.stringify(args.riskReport),
       created,
       expires,
+      args.pactId ?? null,
     );
     return {
       id, status: "pending",
       tx: args.tx, policyVerdict: args.policyVerdict, riskReport: args.riskReport,
       createdAt: created, expiresAt: expires,
+      ...(args.pactId !== undefined ? { pactId: args.pactId } : {}),
     };
   }
 
   get(id: string): PendingOp | undefined {
     const r = this.db.prepare(
-      "SELECT id,status,tx_json,policy_verdict_json,risk_report_json,created_at,expires_at,decided_at,decided_by,tx_hash FROM pending_ops WHERE id=?",
+      "SELECT id,status,tx_json,policy_verdict_json,risk_report_json,created_at,expires_at,decided_at,decided_by,tx_hash,pact_id FROM pending_ops WHERE id=?",
     ).get(id) as any;
     if (!r) return undefined;
     return {
@@ -54,6 +57,7 @@ export class PendingQueue {
       createdAt: r.created_at, expiresAt: r.expires_at,
       decidedAt: r.decided_at ?? undefined, decidedBy: r.decided_by ?? undefined,
       txHash: r.tx_hash ?? undefined,
+      pactId: r.pact_id ?? undefined,
     };
   }
 
