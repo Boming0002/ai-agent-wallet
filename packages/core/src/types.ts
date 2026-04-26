@@ -72,4 +72,35 @@ export interface PendingOp {
   decidedAt?: number;
   decidedBy?: "owner" | "auto" | "system_expire";
   txHash?: Hex;
+  pactId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Pact types (task-scoped authorization)
+// ---------------------------------------------------------------------------
+
+export type PactStatus = "active" | "completed" | "expired" | "revoked";
+
+export interface PactPolicyOverride {
+  perTxMaxWei?: WeiString;
+  autoApproveMaxWei?: WeiString;
+  addressAllowlist?: EthAddress[];
+  addressDenylist?: EthAddress[];
+  contractMethodAllowlist?: { address: EthAddress; selector: Hex }[];
+}
+
+export interface Pact {
+  id: string;
+  name: string;
+  intent: string;
+  policyOverride: PactPolicyOverride;
+  expiresAt: number;
+  maxTotalValueWei: WeiString;
+  maxOpCount?: number;
+  spentWei: WeiString;
+  opCount: number;
+  status: PactStatus;
+  createdAt: number;
+  decidedAt?: number;
+  decidedBy?: "system_complete" | "system_expire" | "owner_revoke";
 }
