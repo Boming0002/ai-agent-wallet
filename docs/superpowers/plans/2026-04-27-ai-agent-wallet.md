@@ -24,7 +24,8 @@
 | 5 | `core/chain` (ethers v6 wrapper) | Mocked in tests, real in integration |
 | 6 | `core/risk` (depends on chain) | Pre-flight checks |
 | 7 | `core/approval` (HITL queue) | Ties policy + risk + audit + storage together |
-| 8 | `cli` package (Owner UX, daemon, broadcasts) | Independent product slice |
+| 7B | `core/pact` (task-scoped authorization) | The differentiating AI-Agent abstraction; layered on policy + queue + audit |
+| 8 | `cli` package (Owner UX, daemon, broadcasts, pact mgmt) | Independent product slice |
 | 9 | `mcp-server` package (Agent UX) | Mirrors CLI's read surface |
 | 10 | `contracts` (Solidity multisig + tests + Sepolia deploy) | Independent slice |
 | 11 | `cli` multisig commands (drives the contract) | Bridge between core and contracts |
@@ -643,7 +644,7 @@ describe("openDatabase", () => {
       .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
       .all()
       .map((r: any) => r.name);
-    expect(tables).toEqual(["audit_log", "pending_ops", "schema_version"]);
+    expect(tables).toEqual(["audit_log", "pacts", "pending_ops", "schema_version"]);
     db.close();
   });
 
@@ -699,9 +700,27 @@ CREATE TABLE IF NOT EXISTS pending_ops (
   expires_at INTEGER NOT NULL,
   decided_at INTEGER,
   decided_by TEXT,
-  tx_hash TEXT
+  tx_hash TEXT,
+  pact_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_ops(status, created_at);
+
+CREATE TABLE IF NOT EXISTS pacts (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  intent TEXT NOT NULL,
+  policy_override_json TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  max_total_value_wei TEXT NOT NULL,
+  max_op_count INTEGER,
+  spent_wei TEXT NOT NULL DEFAULT '0',
+  op_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  decided_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pacts_status ON pacts(status, expires_at);
 `;
 
 export function openDatabase(dataDir: string): Database.Database {
@@ -2451,6 +2470,675 @@ git commit -m "chore(core): barrel export for downstream packages"
 
 ---
 
+## Phase 7B — `core/pact` (task-scoped authorization)
+
+Pacts are persistent authorization objects: a named, time-bounded, budget-bounded delegation with a policy that narrows the global one. See spec §17 for full semantics.
+
+### Task 7B.1: Pact types + zod schema
+
+**Files:** Create `packages/core/src/pact/schema.ts`; modify `packages/core/src/types.ts`
+
+- [ ] **Step 1:** Append Pact types to `packages/core/src/types.ts`:
+
+```ts
+// (append to existing types.ts)
+
+export type PactStatus = "active" | "completed" | "expired" | "revoked";
+
+export interface PactPolicyOverride {
+  perTxMaxWei?: WeiString;
+  autoApproveMaxWei?: WeiString;
+  addressAllowlist?: EthAddress[];
+  addressDenylist?: EthAddress[];
+  contractMethodAllowlist?: { address: EthAddress; selector: Hex }[];
+}
+
+export interface Pact {
+  id: string;
+  name: string;
+  intent: string;
+  policyOverride: PactPolicyOverride;
+  expiresAt: number;
+  maxTotalValueWei: WeiString;
+  maxOpCount?: number;
+  spentWei: WeiString;
+  opCount: number;
+  status: PactStatus;
+  createdAt: number;
+  decidedAt?: number;
+  decidedBy?: "system_complete" | "system_expire" | "owner_revoke";
+}
+```
+
+- [ ] **Step 2:** Create `packages/core/src/pact/schema.ts`:
+
+```ts
+// packages/core/src/pact/schema.ts
+import { z } from "zod";
+
+const Decimal = z.string().regex(/^\d+$/);
+const Address = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
+const Selector = z.string().regex(/^0x[0-9a-fA-F]{8}$/);
+
+export const PactPolicyOverrideSchema = z.object({
+  perTxMaxWei: Decimal.optional(),
+  autoApproveMaxWei: Decimal.optional(),
+  addressAllowlist: z.array(Address).optional(),
+  addressDenylist: z.array(Address).optional(),
+  contractMethodAllowlist: z.array(z.object({ address: Address, selector: Selector })).optional(),
+});
+
+export const PactCreateInputSchema = z.object({
+  name: z.string().min(1).max(128),
+  intent: z.string().min(1).max(2048),
+  policyOverride: PactPolicyOverrideSchema.default({}),
+  expiresAtMs: z.number().int().positive(),
+  maxTotalValueWei: Decimal,
+  maxOpCount: z.number().int().positive().optional(),
+});
+
+export type PactCreateInput = z.infer<typeof PactCreateInputSchema>;
+```
+
+- [ ] **Step 3:** Typecheck.
+
+```bash
+pnpm --filter @ai-agent-wallet/core typecheck
+```
+
+- [ ] **Step 4:** Commit.
+
+```bash
+git add packages/core/src/types.ts packages/core/src/pact/schema.ts
+git commit -m "feat(core/pact): types and zod schema"
+```
+
+### Task 7B.2: PactManager
+
+**Files:** Create `packages/core/src/pact/manager.ts`, `packages/core/test/pact/manager.test.ts`
+
+- [ ] **Step 1:** Test:
+
+```ts
+// packages/core/test/pact/manager.test.ts
+import { describe, it, expect } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { openDatabase } from "../../src/storage/db.js";
+import { PactManager } from "../../src/pact/manager.js";
+
+function fresh() {
+  const dir = mkdtempSync(path.join(tmpdir(), "wallet-"));
+  const db = openDatabase(dir);
+  let now = 1700000000000;
+  const m = new PactManager(db, () => now);
+  return { db, m, advance: (ms: number) => { now += ms; } };
+}
+
+describe("PactManager", () => {
+  it("creates an active Pact with zero spent / opCount", () => {
+    const { m } = fresh();
+    const p = m.create({
+      name: "supplier-x", intent: "pay supplier",
+      policyOverride: {}, expiresAtMs: 1700000000000 + 86400000,
+      maxTotalValueWei: "1000000000000000000",
+    });
+    expect(p.status).toBe("active");
+    expect(p.spentWei).toBe("0");
+    expect(p.opCount).toBe(0);
+    expect(p.id).toMatch(/^[A-Z0-9]{16}$/);
+  });
+
+  it("rejects creation with policyOverride wider than global is the engine's job (PactManager.create only validates shape)", () => {
+    const { m } = fresh();
+    expect(() => m.create({
+      name: "x", intent: "x",
+      policyOverride: { perTxMaxWei: "abc" } as any,
+      expiresAtMs: 1700000086400000, maxTotalValueWei: "100",
+    })).toThrow();
+  });
+
+  it("consume increments spent + opCount and leaves active when below caps", () => {
+    const { m } = fresh();
+    const p = m.create({
+      name: "x", intent: "x", policyOverride: {},
+      expiresAtMs: 1700000086400000, maxTotalValueWei: "1000000000000000000",
+      maxOpCount: 5,
+    });
+    m.consume(p.id, "100");
+    const p2 = m.get(p.id)!;
+    expect(p2.spentWei).toBe("100");
+    expect(p2.opCount).toBe(1);
+    expect(p2.status).toBe("active");
+  });
+
+  it("consume marks completed when budget exhausted", () => {
+    const { m } = fresh();
+    const p = m.create({
+      name: "x", intent: "x", policyOverride: {},
+      expiresAtMs: 1700000086400000, maxTotalValueWei: "100",
+    });
+    m.consume(p.id, "100");
+    expect(m.get(p.id)?.status).toBe("completed");
+  });
+
+  it("consume marks completed when maxOpCount reached", () => {
+    const { m } = fresh();
+    const p = m.create({
+      name: "x", intent: "x", policyOverride: {},
+      expiresAtMs: 1700000086400000, maxTotalValueWei: "1000000",
+      maxOpCount: 2,
+    });
+    m.consume(p.id, "1");
+    m.consume(p.id, "1");
+    expect(m.get(p.id)?.status).toBe("completed");
+  });
+
+  it("consume after completion throws", () => {
+    const { m } = fresh();
+    const p = m.create({
+      name: "x", intent: "x", policyOverride: {},
+      expiresAtMs: 1700000086400000, maxTotalValueWei: "10",
+    });
+    m.consume(p.id, "10");
+    expect(() => m.consume(p.id, "1")).toThrow();
+  });
+
+  it("expireDue marks past-deadline pacts as expired", () => {
+    const { m, advance } = fresh();
+    const p = m.create({
+      name: "x", intent: "x", policyOverride: {},
+      expiresAtMs: 1700000000000 + 1000, maxTotalValueWei: "1000",
+    });
+    advance(2000);
+    expect(m.expireDue()).toEqual([p.id]);
+    expect(m.get(p.id)?.status).toBe("expired");
+  });
+
+  it("revoke transitions active → revoked", () => {
+    const { m } = fresh();
+    const p = m.create({
+      name: "x", intent: "x", policyOverride: {},
+      expiresAtMs: 1700000086400000, maxTotalValueWei: "100",
+    });
+    m.revoke(p.id);
+    expect(m.get(p.id)?.status).toBe("revoked");
+  });
+
+  it("list filters by status", () => {
+    const { m } = fresh();
+    const a = m.create({ name: "a", intent: "x", policyOverride: {}, expiresAtMs: 1700000086400000, maxTotalValueWei: "100" });
+    const b = m.create({ name: "b", intent: "x", policyOverride: {}, expiresAtMs: 1700000086400000, maxTotalValueWei: "100" });
+    m.revoke(b.id);
+    expect(m.list("active").map((p) => p.id)).toEqual([a.id]);
+    expect(m.list("revoked").map((p) => p.id)).toEqual([b.id]);
+  });
+});
+```
+
+- [ ] **Step 2:** Run; expect FAIL.
+
+- [ ] **Step 3:** Implement:
+
+```ts
+// packages/core/src/pact/manager.ts
+import type Database from "better-sqlite3";
+import type { Pact, PactStatus, WeiString } from "../types.js";
+import { PactCreateInput, PactCreateInputSchema } from "./schema.js";
+
+const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+function ulid16(): string {
+  let id = "";
+  for (let i = 0; i < 16; i++) id += ALPHABET[(Math.random() * ALPHABET.length) | 0];
+  return id;
+}
+
+export class PactManager {
+  constructor(private db: Database.Database, private now: () => number = Date.now) {}
+
+  create(input: PactCreateInput): Pact {
+    const v = PactCreateInputSchema.parse(input);
+    const id = ulid16();
+    const created = this.now();
+    this.db.prepare(`
+      INSERT INTO pacts (id, name, intent, policy_override_json, expires_at, max_total_value_wei, max_op_count, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
+    `).run(
+      id, v.name, v.intent, JSON.stringify(v.policyOverride),
+      v.expiresAtMs, v.maxTotalValueWei, v.maxOpCount ?? null, created,
+    );
+    return this.get(id)!;
+  }
+
+  get(id: string): Pact | undefined {
+    const r = this.db.prepare(
+      "SELECT id, name, intent, policy_override_json, expires_at, max_total_value_wei, max_op_count, spent_wei, op_count, status, created_at, decided_at, decided_by FROM pacts WHERE id = ?",
+    ).get(id) as any;
+    if (!r) return undefined;
+    return {
+      id: r.id, name: r.name, intent: r.intent,
+      policyOverride: JSON.parse(r.policy_override_json),
+      expiresAt: r.expires_at, maxTotalValueWei: r.max_total_value_wei,
+      maxOpCount: r.max_op_count ?? undefined,
+      spentWei: r.spent_wei, opCount: r.op_count,
+      status: r.status as PactStatus, createdAt: r.created_at,
+      decidedAt: r.decided_at ?? undefined,
+      decidedBy: r.decided_by ?? undefined,
+    };
+  }
+
+  list(status?: PactStatus): Pact[] {
+    const rows = (status
+      ? this.db.prepare("SELECT id FROM pacts WHERE status = ? ORDER BY created_at DESC").all(status)
+      : this.db.prepare("SELECT id FROM pacts ORDER BY created_at DESC").all()
+    ) as Array<{ id: string }>;
+    return rows.map((r) => this.get(r.id)!).filter(Boolean);
+  }
+
+  /** Atomically: status=active gate, expiry gate, increments, complete-on-cap. Throws if not consumable. */
+  consume(id: string, valueWei: WeiString): Pact {
+    const p = this.get(id);
+    if (!p) throw new Error(`pact ${id} not found`);
+    if (p.status !== "active") throw new Error(`pact ${id} is ${p.status}`);
+    if (p.expiresAt <= this.now()) {
+      this.transition(id, "expired", "system_expire");
+      throw new Error(`pact ${id} expired`);
+    }
+    const nextSpent = (BigInt(p.spentWei) + BigInt(valueWei)).toString();
+    const nextOps = p.opCount + 1;
+    if (BigInt(nextSpent) > BigInt(p.maxTotalValueWei)) {
+      throw new Error(`pact ${id} budget would be exceeded`);
+    }
+    if (p.maxOpCount !== undefined && nextOps > p.maxOpCount) {
+      throw new Error(`pact ${id} op count would be exceeded`);
+    }
+    this.db.prepare("UPDATE pacts SET spent_wei = ?, op_count = ? WHERE id = ?")
+      .run(nextSpent, nextOps, id);
+    const completed =
+      BigInt(nextSpent) === BigInt(p.maxTotalValueWei) ||
+      (p.maxOpCount !== undefined && nextOps === p.maxOpCount);
+    if (completed) this.transition(id, "completed", "system_complete");
+    return this.get(id)!;
+  }
+
+  revoke(id: string): void {
+    const p = this.get(id);
+    if (!p) throw new Error(`pact ${id} not found`);
+    if (p.status !== "active") throw new Error(`pact ${id} is ${p.status}`);
+    this.transition(id, "revoked", "owner_revoke");
+  }
+
+  expireDue(): string[] {
+    const now = this.now();
+    const rows = this.db.prepare(
+      "SELECT id FROM pacts WHERE status = 'active' AND expires_at <= ?",
+    ).all(now) as Array<{ id: string }>;
+    for (const r of rows) this.transition(r.id, "expired", "system_expire");
+    return rows.map((r) => r.id);
+  }
+
+  private transition(id: string, to: PactStatus, by: NonNullable<Pact["decidedBy"]>): void {
+    this.db.prepare(
+      "UPDATE pacts SET status = ?, decided_at = ?, decided_by = ? WHERE id = ?",
+    ).run(to, this.now(), by, id);
+  }
+}
+```
+
+- [ ] **Step 4:** Run; expect PASS.
+
+- [ ] **Step 5:** Commit.
+
+```bash
+git add packages/core/src/pact/manager.ts packages/core/test/pact/manager.test.ts
+git commit -m "feat(core/pact): PactManager with create/consume/revoke/expire lifecycle"
+```
+
+### Task 7B.3: Policy intersection helper
+
+**Files:** Create `packages/core/src/pact/intersect.ts`, `packages/core/test/pact/intersect.test.ts`
+
+When evaluating under a Pact, the effective policy is the intersection of global and Pact-override per spec §7.4.
+
+- [ ] **Step 1:** Test:
+
+```ts
+// packages/core/test/pact/intersect.test.ts
+import { describe, it, expect } from "vitest";
+import { intersectPolicy } from "../../src/pact/intersect.js";
+import { defaultPolicy } from "../../src/policy/schema.js";
+
+describe("intersectPolicy", () => {
+  it("returns global when override is empty", () => {
+    expect(intersectPolicy(defaultPolicy(), {})).toEqual(defaultPolicy());
+  });
+  it("uses min for perTxMax / autoApproveMax", () => {
+    const merged = intersectPolicy(defaultPolicy(), {
+      perTxMaxWei: "100", autoApproveMaxWei: "50",
+    });
+    expect(merged.perTxMaxWei).toBe("100");
+    expect(merged.autoApproveMaxWei).toBe("50");
+  });
+  it("intersects allowlists when both non-empty", () => {
+    const merged = intersectPolicy(
+      { ...defaultPolicy(), addressAllowlist: ["0x" + "11".repeat(20), "0x" + "22".repeat(20)] as any },
+      { addressAllowlist: ["0x" + "22".repeat(20)] as any },
+    );
+    expect(merged.addressAllowlist).toEqual(["0x" + "22".repeat(20)]);
+  });
+  it("uses pact's allowlist when global is empty", () => {
+    const merged = intersectPolicy(defaultPolicy(), { addressAllowlist: ["0x" + "33".repeat(20)] as any });
+    expect(merged.addressAllowlist).toEqual(["0x" + "33".repeat(20)]);
+  });
+  it("unions denylists", () => {
+    const merged = intersectPolicy(
+      { ...defaultPolicy(), addressDenylist: ["0x" + "aa".repeat(20)] as any },
+      { addressDenylist: ["0x" + "bb".repeat(20)] as any },
+    );
+    expect(merged.addressDenylist.sort()).toEqual([
+      "0x" + "aa".repeat(20), "0x" + "bb".repeat(20),
+    ].sort());
+  });
+});
+```
+
+- [ ] **Step 2:** Implement:
+
+```ts
+// packages/core/src/pact/intersect.ts
+import type { Policy } from "../policy/schema.js";
+import type { PactPolicyOverride } from "../types.js";
+
+function eqAddr(a: string, b: string) { return a.toLowerCase() === b.toLowerCase(); }
+function minBig(a: string, b: string) { return BigInt(a) < BigInt(b) ? a : b; }
+
+export function intersectPolicy(global: Policy, override: PactPolicyOverride): Policy {
+  return {
+    ...global,
+    perTxMaxWei: override.perTxMaxWei ? minBig(global.perTxMaxWei, override.perTxMaxWei) : global.perTxMaxWei,
+    autoApproveMaxWei: override.autoApproveMaxWei
+      ? minBig(global.autoApproveMaxWei, override.autoApproveMaxWei) : global.autoApproveMaxWei,
+    addressAllowlist:
+      global.addressAllowlist.length === 0 && override.addressAllowlist
+        ? override.addressAllowlist
+        : (override.addressAllowlist
+            ? global.addressAllowlist.filter((a) => override.addressAllowlist!.some((b) => eqAddr(a, b)))
+            : global.addressAllowlist),
+    addressDenylist: Array.from(new Set([
+      ...global.addressDenylist,
+      ...(override.addressDenylist ?? []),
+    ])),
+    contractMethodAllowlist: override.contractMethodAllowlist
+      ? [...global.contractMethodAllowlist, ...override.contractMethodAllowlist]
+      : global.contractMethodAllowlist,
+  };
+}
+```
+
+- [ ] **Step 3:** Run; expect PASS.
+
+- [ ] **Step 4:** Commit.
+
+```bash
+git add packages/core/src/pact/intersect.ts packages/core/test/pact/intersect.test.ts
+git commit -m "feat(core/pact): policy intersection (min, intersection, union per §7.4)"
+```
+
+### Task 7B.4: Wallet façade integration
+
+**Files:** Modify `packages/core/src/wallet.ts`, `packages/core/test/wallet.test.ts`
+
+Updates `Wallet.propose` to accept an optional `pactId`. When present, the Pact's gates run before the global policy/risk evaluation, and successful broadcasts call `manager.consume`.
+
+- [ ] **Step 1:** Add tests for Pact path:
+
+```ts
+// (append to packages/core/test/wallet.test.ts)
+import { PactManager } from "../src/pact/manager.js";
+
+describe("Wallet façade — Pact integration", () => {
+  function fresh() {
+    const dir = mkdtempSync(path.join(tmpdir(), "wallet-"));
+    const db = openDatabase(dir);
+    const audit = new AuditLog(db, () => 1700000000000);
+    const queue = new PendingQueue(db, () => 1700000000000);
+    const pactMgr = new PactManager(db, () => 1700000000000);
+    const policy = defaultPolicy();
+    const chain = new EthersChainClient(new MockProvider({}) as any);
+    const w = new WalletFacade({
+      address: "0x" + "ee".repeat(20) as any,
+      audit, queue, chain, getPolicy: () => policy, pactManager: pactMgr,
+    });
+    return { w, audit, queue, pactMgr };
+  }
+
+  it("denies when pact_id missing", async () => {
+    const { w } = fresh();
+    const r = await w.propose({ to: "0x" + "aa".repeat(20) as any, value: "1", data: "0x" as any },
+      "NONEXISTENT00000");
+    expect(r.kind).toBe("deny");
+    expect(r.rule).toBe("pact_not_found");
+  });
+
+  it("denies when pact would exceed budget", async () => {
+    const { w, pactMgr } = fresh();
+    const p = pactMgr.create({
+      name: "x", intent: "x", policyOverride: {},
+      expiresAtMs: 1700000000000 + 86400000,
+      maxTotalValueWei: "100",
+    });
+    const r = await w.propose({ to: "0x" + "aa".repeat(20) as any, value: "1000", data: "0x" as any }, p.id);
+    expect(r.kind).toBe("deny");
+    expect(r.rule).toBe("pact_budget_exceeded");
+  });
+
+  it("auto-approves under pact when within bounds and global auto-approves", async () => {
+    const { w, pactMgr } = fresh();
+    const p = pactMgr.create({
+      name: "x", intent: "x", policyOverride: {},
+      expiresAtMs: 1700000000000 + 86400000,
+      maxTotalValueWei: "100000000000000000",
+    });
+    const r = await w.propose({ to: "0x" + "aa".repeat(20) as any, value: "1000000000000000", data: "0x" as any }, p.id);
+    expect(r.kind).toBe("auto_approve");
+  });
+});
+```
+
+- [ ] **Step 2:** Update `packages/core/src/wallet.ts` to accept optional `pactId`:
+
+```ts
+// (replace the existing wallet.ts file with this version)
+import type { ChainClient } from "./chain/client.js";
+import type { AuditLog } from "./audit/log.js";
+import type { PendingQueue } from "./approval/queue.js";
+import type { PactManager } from "./pact/manager.js";
+import type { Policy } from "./policy/schema.js";
+import { evaluatePolicy } from "./policy/engine.js";
+import { assessRisk } from "./risk/assess.js";
+import { intersectPolicy } from "./pact/intersect.js";
+import type { ProposedTx, EthAddress, PolicyVerdict, PendingOp, RiskReport } from "./types.js";
+
+export interface WalletDeps {
+  address: EthAddress;
+  chain: ChainClient;
+  audit: AuditLog;
+  queue: PendingQueue;
+  getPolicy: () => Policy;
+  pactManager: PactManager;
+  hitlTtlMs?: number;
+}
+
+export interface ProposeResult {
+  kind: PolicyVerdict["kind"];
+  reason: string;
+  rule?: string;
+  opId?: string;
+  pactId?: string;
+  risk?: RiskReport;
+}
+
+export class Wallet {
+  constructor(private deps: WalletDeps) {}
+
+  get address() { return this.deps.address; }
+
+  async dailySpentWei(): Promise<bigint> {
+    const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
+    const since = dayStart.getTime();
+    const rows = this.deps.audit.query({ kind: "broadcast" });
+    let sum = 0n;
+    for (const r of rows) {
+      if (r.ts >= since) {
+        const v = (r.payload as { value?: string }).value;
+        if (v) sum += BigInt(v);
+      }
+    }
+    return sum;
+  }
+
+  async propose(tx: ProposedTx, pactId?: string): Promise<ProposeResult> {
+    this.deps.audit.append("propose", { tx, pact_id: pactId });
+    const value = BigInt(tx.value);
+
+    let effectivePolicy = this.deps.getPolicy();
+    if (pactId) {
+      // Lazy expire pass.
+      this.deps.pactManager.expireDue();
+      const pact = this.deps.pactManager.get(pactId);
+      if (!pact) {
+        const reason = `pact ${pactId} not found`;
+        this.deps.audit.append("policy_deny", { tx, rule: "pact_not_found", reason });
+        return { kind: "deny", rule: "pact_not_found", reason };
+      }
+      if (pact.status !== "active") {
+        const reason = `pact ${pactId} is ${pact.status}`;
+        this.deps.audit.append("policy_deny", { tx, rule: "pact_not_active", reason });
+        return { kind: "deny", rule: "pact_not_active", reason };
+      }
+      // Budget gate.
+      if (BigInt(pact.spentWei) + value > BigInt(pact.maxTotalValueWei)) {
+        const reason = `would exceed pact budget ${pact.maxTotalValueWei}`;
+        this.deps.audit.append("policy_deny", { tx, rule: "pact_budget_exceeded", reason });
+        return { kind: "deny", rule: "pact_budget_exceeded", reason };
+      }
+      // Op count gate.
+      if (pact.maxOpCount !== undefined && pact.opCount + 1 > pact.maxOpCount) {
+        const reason = `would exceed pact op count ${pact.maxOpCount}`;
+        this.deps.audit.append("policy_deny", { tx, rule: "pact_ops_exceeded", reason });
+        return { kind: "deny", rule: "pact_ops_exceeded", reason };
+      }
+      effectivePolicy = intersectPolicy(this.deps.getPolicy(), pact.policyOverride);
+    }
+
+    const dailySpent = await this.dailySpentWei();
+    const verdict = evaluatePolicy(tx, effectivePolicy, dailySpent);
+    if (verdict.kind === "deny") {
+      this.deps.audit.append("policy_deny", { tx, rule: verdict.rule, reason: verdict.reason });
+      return { kind: "deny", rule: verdict.rule, reason: verdict.reason };
+    }
+
+    const risk = await assessRisk(this.deps.chain, tx, this.deps.address);
+    if (!risk.simulation.ok) {
+      this.deps.audit.append("risk_fail", { tx, revert: risk.simulation.revertReason, flags: risk.flags });
+      return { kind: "deny", rule: "simulation_revert", reason: risk.simulation.revertReason, risk };
+    }
+
+    const ttl = this.deps.hitlTtlMs ?? 30 * 60 * 1000;
+    const op = this.deps.queue.enqueue({ tx, policyVerdict: verdict, riskReport: risk, ttlMs: ttl });
+    // Persist pact_id on the queue row so approve/daemon can consume the right Pact post-broadcast.
+    if (pactId) {
+      // Update the row directly (PendingQueue does not expose mutate-pact API; small SQL update keeps the demo light).
+      // The CLI/daemon read this column from the row to call pactManager.consume after broadcast.
+    }
+    if (verdict.kind === "auto_approve") {
+      this.deps.audit.append("auto_approve", { id: op.id, pact_id: pactId });
+      return { kind: "auto_approve", reason: verdict.reason, opId: op.id, pactId, risk };
+    }
+    this.deps.audit.append("enqueue_hitl", { id: op.id, expires_at: op.expiresAt, pact_id: pactId });
+    return { kind: "require_hitl", reason: verdict.reason, opId: op.id, pactId, risk };
+  }
+}
+```
+
+- [ ] **Step 3:** Update `PendingQueue.enqueue` (in `packages/core/src/approval/queue.ts`) to also accept and persist `pactId`. Change the EnqueueArgs interface and INSERT statement:
+
+```ts
+export interface EnqueueArgs {
+  tx: ProposedTx;
+  policyVerdict: PolicyVerdict;
+  riskReport: RiskReport;
+  ttlMs: number;
+  pactId?: string;
+}
+```
+
+In `enqueue`:
+```ts
+this.db.prepare(`
+  INSERT INTO pending_ops(id, status, tx_json, policy_verdict_json, risk_report_json, created_at, expires_at, pact_id)
+  VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)
+`).run(
+  id, JSON.stringify(args.tx), JSON.stringify(args.policyVerdict),
+  JSON.stringify(args.riskReport), created, expires, args.pactId ?? null,
+);
+```
+
+And include `pact_id` in `get()`'s SELECT, returning it as `pactId` on the `PendingOp`. Update the `PendingOp` type in `types.ts` to include `pactId?: string`.
+
+- [ ] **Step 4:** Update `Wallet.propose` to call `enqueue({ ..., pactId })` (pass the value through) — replace the placeholder block in step 2.
+
+- [ ] **Step 5:** Run tests; expect PASS.
+
+```bash
+pnpm --filter @ai-agent-wallet/core test
+```
+
+- [ ] **Step 6:** Commit.
+
+```bash
+git add packages/core/src
+git commit -m "feat(core): wallet propose accepts pact_id; queue persists pact_id"
+```
+
+### Task 7B.5: Pact-aware broadcast in CLI/daemon (forward declaration)
+
+When Phase 8.6 (CLI `approve`) and Phase 8.7 (daemon) broadcast a tx that came from a Pact, they must call `pactManager.consume(pactId, tx.value)` after a successful broadcast and append a `pact_consume` audit entry. **This is captured here so the implementer of Phase 8 doesn't miss it; the actual code change is part of those tasks.**
+
+The change in `approve.ts`:
+
+```ts
+// inside the success path, after queue.markBroadcast and before db.close:
+const op = queue.get(opId)!;
+if (op.pactId) {
+  const pactBefore = pactMgr.get(op.pactId);
+  pactMgr.consume(op.pactId, op.tx.value);
+  const pactAfter = pactMgr.get(op.pactId);
+  audit.append("pact_consume", {
+    pact_id: op.pactId, op_id: opId,
+    value: op.tx.value,
+    newSpent: pactAfter!.spentWei,
+    newOpCount: pactAfter!.opCount,
+  });
+  if (pactBefore!.status === "active" && pactAfter!.status === "completed") {
+    audit.append("pact_complete", {
+      pact_id: op.pactId,
+      reason: BigInt(pactAfter!.spentWei) >= BigInt(pactAfter!.maxTotalValueWei)
+        ? "budget_exhausted" : "op_count_reached",
+    });
+  }
+}
+```
+
+Same hook in `daemon.ts`. The audit `broadcast` event payload should also include `pact_id` when present.
+
+(No file edits in this task; this is documentation for Phase 8 implementers.)
+
+- [ ] **Step 1:** Mark this task as no-op + commit doc note (optional). Otherwise skip and just remember to apply in Phase 8.
+
+---
+
 ## Phase 8 — `cli` package (Owner UX)
 
 The CLI is the only place private keys are reconstructed and the only place that broadcasts. Each command lives in its own file under `src/commands/`.
@@ -3110,6 +3798,211 @@ git add packages/cli/src/commands/daemon.ts
 git commit -m "feat(cli): aiwallet daemon — long-lived auto-approver"
 ```
 
+### Task 8.8: `pact` command group
+
+**Files:** Create `packages/cli/src/commands/pact.ts`; modify `packages/cli/src/index.ts` to register it.
+
+- [ ] **Step 1:** Implement:
+
+```ts
+// packages/cli/src/commands/pact.ts
+import type { Command } from "commander";
+import fs from "node:fs";
+import {
+  resolveDataDir, openDatabase, AuditLog, PactManager, PactPolicyOverrideSchema,
+  loadPolicy,
+} from "@ai-agent-wallet/core";
+import { ok, info, err, banner, ethFromWei } from "../format.js";
+
+function parseDuration(s: string): number {
+  const m = s.match(/^(\d+)([smhd])$/);
+  if (!m) throw new Error(`bad duration ${s}; use e.g. 30m / 3h / 7d`);
+  const n = parseInt(m[1]!, 10);
+  const unit = m[2]!;
+  const mult = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[unit]!;
+  return n * mult;
+}
+
+export function registerPact(program: Command): void {
+  const p = program.command("pact").description("Task-scoped authorization");
+
+  p.command("create")
+    .requiredOption("--name <s>")
+    .requiredOption("--intent <s>")
+    .requiredOption("--expires <duration>", "e.g. 3d, 12h, 30m")
+    .requiredOption("--max-budget <wei>", "max total value in wei")
+    .option("--max-ops <n>", "max op count", (v) => parseInt(v, 10))
+    .option("--policy-override <path>", "JSON file for policy override")
+    .option("--data-dir <dir>")
+    .action(async (opts) => {
+      const dataDir = resolveDataDir(opts.dataDir);
+      const override = opts.policyOverride
+        ? PactPolicyOverrideSchema.parse(JSON.parse(fs.readFileSync(opts.policyOverride, "utf8")))
+        : {};
+      // Reject overrides looser than global.
+      const global = loadPolicy(dataDir);
+      if (override.perTxMaxWei && BigInt(override.perTxMaxWei) > BigInt(global.perTxMaxWei)) {
+        err("override perTxMaxWei is wider than global"); process.exit(2);
+      }
+      if (override.autoApproveMaxWei && BigInt(override.autoApproveMaxWei) > BigInt(global.autoApproveMaxWei)) {
+        err("override autoApproveMaxWei is wider than global"); process.exit(2);
+      }
+      const expiresAtMs = Date.now() + parseDuration(opts.expires);
+      const db = openDatabase(dataDir);
+      const mgr = new PactManager(db);
+      const pact = mgr.create({
+        name: opts.name, intent: opts.intent, policyOverride: override,
+        expiresAtMs, maxTotalValueWei: opts.maxBudget,
+        maxOpCount: opts.maxOps,
+      });
+      new AuditLog(db).append("pact_create", {
+        pact_id: pact.id, name: pact.name, intent: pact.intent,
+        policy: pact.policyOverride,
+        completionConditions: {
+          expiresAt: pact.expiresAt,
+          maxTotalValueWei: pact.maxTotalValueWei,
+          maxOpCount: pact.maxOpCount ?? null,
+        },
+      });
+      banner("PACT CREATED");
+      info(`id:           ${pact.id}`);
+      info(`name:         ${pact.name}`);
+      info(`intent:       ${pact.intent}`);
+      info(`expires at:   ${new Date(pact.expiresAt).toISOString()}`);
+      info(`max budget:   ${ethFromWei(pact.maxTotalValueWei)}`);
+      if (pact.maxOpCount !== undefined) info(`max ops:      ${pact.maxOpCount}`);
+      ok(`copy this id to your Agent: ${pact.id}`);
+      db.close();
+    });
+
+  p.command("list")
+    .option("--status <s>", "active|completed|expired|revoked")
+    .option("--data-dir <dir>")
+    .action((opts) => {
+      const dataDir = resolveDataDir(opts.dataDir);
+      const db = openDatabase(dataDir);
+      const mgr = new PactManager(db);
+      mgr.expireDue();
+      const items = mgr.list(opts.status);
+      banner("PACTS");
+      if (items.length === 0) { info("(none)"); db.close(); return; }
+      for (const it of items) {
+        const remain = Math.max(0, Math.round((it.expiresAt - Date.now()) / 1000));
+        console.log(
+          `${it.id}  ${it.status}  ${it.name}  spent=${ethFromWei(it.spentWei)}/${ethFromWei(it.maxTotalValueWei)}  ops=${it.opCount}/${it.maxOpCount ?? "∞"}  ttl=${remain}s`,
+        );
+      }
+      db.close();
+    });
+
+  p.command("show <pactId>")
+    .option("--data-dir <dir>")
+    .action((pactId: string, opts) => {
+      const dataDir = resolveDataDir(opts.dataDir);
+      const db = openDatabase(dataDir);
+      const mgr = new PactManager(db);
+      const it = mgr.get(pactId);
+      if (!it) { err(`pact ${pactId} not found`); process.exit(2); }
+      console.log(JSON.stringify(it, null, 2));
+      db.close();
+    });
+
+  p.command("revoke <pactId>")
+    .option("--reason <s>")
+    .option("--data-dir <dir>")
+    .action((pactId: string, opts) => {
+      const dataDir = resolveDataDir(opts.dataDir);
+      const db = openDatabase(dataDir);
+      const mgr = new PactManager(db);
+      try {
+        mgr.revoke(pactId);
+        new AuditLog(db).append("pact_revoke", { pact_id: pactId, reason: opts.reason ?? "" });
+        ok(`revoked ${pactId}`);
+      } catch (e) {
+        err((e as Error).message); process.exit(2);
+      } finally { db.close(); }
+    });
+}
+```
+
+- [ ] **Step 2:** Register in `src/index.ts`:
+
+```ts
+// add to imports:
+import { registerPact } from "./commands/pact.js";
+// add to registrations:
+registerPact(program);
+```
+
+- [ ] **Step 3:** Build:
+
+```bash
+pnpm --filter @ai-agent-wallet/cli build
+```
+
+- [ ] **Step 4:** Smoke test:
+
+```bash
+AI_WALLET_DATA_DIR=$(mktemp -d) AGENT_SHARE_PASS=p OWNER_SHARE_PASS=p \
+  node packages/cli/dist/index.js init
+AI_WALLET_DATA_DIR=<dir> node packages/cli/dist/index.js pact create \
+  --name "test-pact" --intent "demo budget" --expires 1h \
+  --max-budget 1000000000000000000 --max-ops 5
+AI_WALLET_DATA_DIR=<dir> node packages/cli/dist/index.js pact list
+```
+
+Expected: pact creation prints id and summary; list shows it.
+
+- [ ] **Step 5:** Commit.
+
+```bash
+git add packages/cli/src/commands/pact.ts packages/cli/src/index.ts
+git commit -m "feat(cli): pact create/list/show/revoke commands"
+```
+
+### Task 8.9: Wire `pact_consume` into approve + daemon
+
+**Files:** Modify `packages/cli/src/commands/approve.ts`, `packages/cli/src/commands/daemon.ts`
+
+Per Task 7B.5, after a successful broadcast both code paths must consume the Pact and emit `pact_consume` (plus `pact_complete` if appropriate) audit entries.
+
+- [ ] **Step 1:** In `approve.ts`, after `queue.markBroadcast(op.id, hash, "owner")`:
+
+```ts
+import { PactManager } from "@ai-agent-wallet/core";
+// ...
+const pactMgr = new PactManager(db);
+const pendingRow = queue.get(op.id);
+if (pendingRow?.pactId) {
+  const before = pactMgr.get(pendingRow.pactId);
+  pactMgr.consume(pendingRow.pactId, op.tx.value);
+  const after = pactMgr.get(pendingRow.pactId)!;
+  audit.append("pact_consume", {
+    pact_id: pendingRow.pactId, op_id: op.id,
+    value: op.tx.value, newSpent: after.spentWei, newOpCount: after.opCount,
+  });
+  if (before!.status === "active" && after.status === "completed") {
+    audit.append("pact_complete", {
+      pact_id: pendingRow.pactId,
+      reason: BigInt(after.spentWei) >= BigInt(after.maxTotalValueWei)
+        ? "budget_exhausted" : "op_count_reached",
+    });
+  }
+}
+```
+
+Also: change the `audit.append("broadcast", { id: op.id, tx_hash: hash, value: op.tx.value })` line to include `pact_id: pendingRow?.pactId ?? null`.
+
+- [ ] **Step 2:** Apply the same pattern in `daemon.ts` after `queue.markBroadcast(op.id, hash, "auto")`.
+
+- [ ] **Step 3:** Build + commit.
+
+```bash
+pnpm --filter @ai-agent-wallet/cli build
+git add packages/cli/src/commands/approve.ts packages/cli/src/commands/daemon.ts
+git commit -m "feat(cli): broadcast hooks call pact consume + emit pact audit events"
+```
+
 ---
 
 ## Phase 9 — `mcp-server` package (Agent UX)
@@ -3350,7 +4243,7 @@ export const simulateTxTool = {
 };
 ```
 
-- [ ] **Step 6:** `propose_tx.ts`:
+- [ ] **Step 6:** `propose_tx.ts` (accepts optional `pact_id`):
 
 ```ts
 // packages/mcp-server/src/tools/propose_tx.ts
@@ -3361,17 +4254,19 @@ const Schema = z.object({
   to: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
   value: z.string().regex(/^\d+$/),
   data: z.string().regex(/^0x[0-9a-fA-F]*$/).default("0x"),
+  pact_id: z.string().optional(),
 });
 
 export const proposeTxTool = {
   name: "propose_tx",
-  description: "Propose a transaction. Runs policy + risk; either enqueues for HITL or for the auto-approve daemon. Never broadcasts directly.",
+  description: "Propose a transaction. Runs policy + risk; either enqueues for HITL or for the auto-approve daemon. Never broadcasts directly. Optional pact_id scopes the proposal under a Pact, which further constrains policy and tracks budget/ops against the Pact.",
   inputSchema: { type: "object", properties: {
     to: { type: "string" }, value: { type: "string" }, data: { type: "string" },
+    pact_id: { type: "string", description: "Optional Pact id to scope this proposal under." },
   }, required: ["to", "value"], additionalProperties: false },
   handler: async (args: unknown, ctx: ToolCtx): Promise<ToolResult> => {
-    const { to, value, data } = Schema.parse(args);
-    const result = await ctx.wallet.propose({ to: to as any, value, data: data as any });
+    const { to, value, data, pact_id } = Schema.parse(args);
+    const result = await ctx.wallet.propose({ to: to as any, value, data: data as any }, pact_id);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 };
@@ -3419,17 +4314,106 @@ export const queryAuditTool = {
 };
 ```
 
-- [ ] **Step 9:** Build:
+- [ ] **Step 9:** `list_pacts.ts`:
+
+```ts
+// packages/mcp-server/src/tools/list_pacts.ts
+import { z } from "zod";
+import { PactManager } from "@ai-agent-wallet/core";
+import type { ToolCtx, ToolResult } from "./index.js";
+
+const Schema = z.object({
+  status: z.enum(["active", "completed", "expired", "revoked"]).optional(),
+});
+
+export const listPactsTool = {
+  name: "list_pacts",
+  description: "List Pacts. Optional status filter.",
+  inputSchema: { type: "object", properties: {
+    status: { type: "string", enum: ["active", "completed", "expired", "revoked"] },
+  }, additionalProperties: false },
+  handler: async (args: unknown, ctx: ToolCtx): Promise<ToolResult> => {
+    const { status } = Schema.parse(args);
+    const mgr = new PactManager(ctx.db);
+    mgr.expireDue();
+    return { content: [{ type: "text", text: JSON.stringify(mgr.list(status), null, 2) }] };
+  },
+};
+```
+
+- [ ] **Step 10:** `get_pact.ts`:
+
+```ts
+// packages/mcp-server/src/tools/get_pact.ts
+import { z } from "zod";
+import { PactManager } from "@ai-agent-wallet/core";
+import type { ToolCtx, ToolResult } from "./index.js";
+
+const Schema = z.object({ pact_id: z.string() });
+
+export const getPactTool = {
+  name: "get_pact",
+  description: "Inspect a single Pact by id. Includes intent, policy override, completion conditions, and progress (spentWei, opCount, time remaining).",
+  inputSchema: { type: "object", properties: {
+    pact_id: { type: "string" },
+  }, required: ["pact_id"], additionalProperties: false },
+  handler: async (args: unknown, ctx: ToolCtx): Promise<ToolResult> => {
+    const { pact_id } = Schema.parse(args);
+    const mgr = new PactManager(ctx.db);
+    mgr.expireDue();
+    const p = mgr.get(pact_id);
+    if (!p) return { content: [{ type: "text", text: `pact ${pact_id} not found` }], isError: true };
+    return { content: [{ type: "text", text: JSON.stringify({
+      ...p,
+      timeRemainingMs: Math.max(0, p.expiresAt - Date.now()),
+      remainingBudgetWei: (BigInt(p.maxTotalValueWei) - BigInt(p.spentWei)).toString(),
+    }, null, 2) }] };
+  },
+};
+```
+
+- [ ] **Step 11:** Update tool registry `src/tools/index.ts` to include the two new tools and the `db` field on `ToolCtx`. Replace the registry block:
+
+```ts
+// in packages/mcp-server/src/tools/index.ts
+import type Database from "better-sqlite3";
+// ... existing imports
+import { listPactsTool } from "./list_pacts.js";
+import { getPactTool } from "./get_pact.js";
+
+export interface ToolCtx {
+  wallet: Wallet;
+  dataDir: string;
+  chain: ChainClient;
+  audit: AuditLog;
+  queue: PendingQueue;
+  db: Database.Database;
+}
+
+const REGISTRY: ToolDef[] = [
+  getAddressTool, getBalanceTool, getPolicyTool, simulateTxTool,
+  proposeTxTool, listPendingTool, queryAuditTool,
+  listPactsTool, getPactTool,
+];
+```
+
+And update `src/index.ts` (server bootstrap) to pass `db` into the `ctx`:
+
+```ts
+const ctx = { wallet, dataDir, chain, audit, queue, db };
+```
+
+- [ ] **Step 12:** Build:
 
 ```bash
 pnpm --filter @ai-agent-wallet/mcp-server build
 ```
 
-- [ ] **Step 10:** Commit.
+- [ ] **Step 13:** Commit.
 
 ```bash
-git add packages/mcp-server/src/tools
-git commit -m "feat(mcp-server): get_address, get_balance, get_policy, simulate_tx, propose_tx, list_pending, query_audit"
+git add packages/mcp-server/src/tools packages/mcp-server/src/index.ts
+git commit -m "feat(mcp-server): list_pacts, get_pact tools; propose_tx accepts pact_id"
 ```
 
 ### Task 9.3: README for plugging into Claude Code / Cursor
@@ -4470,11 +5454,11 @@ git commit -m "docs: personas and scenarios"
   **Problem 1 — Unbypassable key isolation + threshold authorization.**
   Why it matters: a compromised AI agent (prompt injection, jailbreak, malicious tool result) cannot move funds. How we solve it: 2-of-2 MPC (Shamir over Z/nZ); the agent process literally lacks the second share; combine + sign happens only in the trusted Owner CLI (or auto-approve daemon Owner explicitly launched). Document the demo-vs-production simulation honestly.
 
-  **Problem 2 — Decision transparency: declarative policy + tamper-evident audit chain.**
-  Why it matters: humans must be able to read, audit, and constrain agent decisions; agents must be able to reason structurally over the rules they live under. How we solve it: declarative JSON policy (deny/allow/cap/method bands, three thresholds), pre-flight policy + risk evaluation returning structured verdicts the LLM can interpret, append-only sha256 hash-chain audit log with per-entry payload+kind+ts+prevHash, plus a `verify` command that walks the chain.
+  **Problem 2 — Bounded delegation: task-scoped authorization with explicit completion conditions.**
+  Why it matters: the Owner's actual mental model is *"let Agent do this specific task for the next 3 days, up to a budget"* — not *"permanently grant Agent the right to send up to 0.1 ETH per tx forever"*. A persistent global policy mismatches that intent and forces over-permissioning. How we solve it: **Pacts** — first-class authorization objects with intent text, a narrowing policy override, and explicit completion conditions (deadline / max budget / max op count). A Pact is created by the Owner, referenced by the Agent on each `propose_tx`, gates the proposal before the global policy runs, and self-destructs (status → completed/expired) when its conditions are met. Combined with the hash-chained audit log, every Agent action has a clear "*under what authorization, with how much budget left*" breadcrumb.
 
-  **Problem 3 — Runtime defenses for AI-specific failure modes.**
-  Why it matters: address hallucination, replay loops, ERC-20 misidentification, runaway calls. How we solve it: pre-flight `eth_getCode` classification, ERC-20 sanity probe (name/symbol/decimals), `eth_call` simulation with revert reason decoding, per-tx hard cap, daily-cap accounting derived from audit log (no drift), TTL on pending ops, contract-method allowlist for tokens.
+  **Problem 3 — Runtime defenses for AI-specific failure modes plus tamper-evident audit.**
+  Why it matters: address hallucination, replay loops, ERC-20 misidentification, runaway calls — and after-the-fact, the Owner needs to be able to prove the historical record hasn't been altered. How we solve it: pre-flight `eth_getCode` classification, ERC-20 sanity probe (name/symbol/decimals), `eth_call` simulation with revert reason decoding, per-tx hard cap, daily-cap accounting derived from audit log (no drift), TTL on pending ops, contract-method allowlist for tokens. The audit log itself is append-only, sha256-chained, and `aiwallet audit verify` walks the chain to prove integrity.
 
 - [ ] **Step 2:** Commit.
 
@@ -4487,7 +5471,7 @@ git commit -m "docs: three key problems and our solutions"
 
 **Files:** Create `docs/03-architecture.md`
 
-- [ ] **Step 1:** Write content (~1500 words). Include:
+- [ ] **Step 1:** Write content (~1800 words). Include:
   - Layer diagram (copy from spec §5).
   - Module table (copy + adapt from spec §5.2).
   - Trust boundaries (spec §5.3).
@@ -4496,11 +5480,12 @@ git commit -m "docs: three key problems and our solutions"
   - Policy bands (auto / hitl / deny) with the threshold table.
   - Audit hash-chain spec.
   - HITL queue lifecycle diagram + SQLite schema.
+  - **Pact section** (copy from spec §17): explain what a Pact is, why task-scoped authorization matters for AI Agents (Owner mental model is "let Agent do task X for N days up to budget Y", not "permanently grant Agent capability Z"), the lifecycle diagram, the policy intersection rules, and what's explicitly NOT in v1 (Cobo's `executionPlan` field, multi-Agent Pacts, on-chain attestations, recipes/templates).
   - Solidity multisig contract overview.
   - Read-only dashboard architecture.
   - Storage layout.
-  - "Key engineering trade-offs" section (copy spec §20).
-  - Future work (copy spec §22 future).
+  - "Key engineering trade-offs" section (copy spec §21).
+  - Future work (copy spec §23 future).
 
 - [ ] **Step 2:** Commit.
 
@@ -4736,40 +5721,43 @@ gh repo view Boming0002/ai-agent-wallet
 
 | Spec section | Covered by |
 |---|---|
-| §2 Personas | Phase 13 / Task 13.1 |
-| §3 Goals G1–G10 | G1 → 3, G2 → 9, G3 → 4, G4 → 5+6, G5 → 7+8, G6 → 2+all-audit-appends, G7 → 10+11, G8 → 12, G9 → 14.1, G10 → 13+14 |
+| §2 Personas (S1–S7) | Phase 13 / Task 13.1; S7 (Pact) → Phase 7B + 8.8 + 9 |
+| §3 Goals G1–G11 | G1 → 3; G2 → 9; G3 → 4; G4 → 5+6; G5 → 7+8; G6 → 2+all-audit-appends; G7 → 10+11; G8 → 12; G9 → 14.1; G10 → 13+14; G11 (Pacts) → 7B + 8.8 + 8.9 + 9 (list_pacts/get_pact/propose_tx pact_id) + 13.3 doc |
 | §4 Threat model | Phase 13 / Task 13.3 + design decisions baked into Phases 3, 7, 8 |
 | §5 Architecture | Phase 13 / Task 13.3 |
 | §6 MPC scheme | Phase 3 (Tasks 3.1–3.3); CLI combine+broadcast in 8.6; daemon in 8.7 |
-| §7 Policy engine | Phase 4 |
+| §7 Policy engine | Phase 4; Pact-scoped intersection (§7.4) → Phase 7B / Task 7B.3 |
 | §8 Risk module | Phase 6 |
-| §9 HITL queue | Phase 7 / Task 7.1 |
-| §10 Audit log | Phase 2 |
+| §9 HITL queue | Phase 7 / Task 7.1; queue persists `pact_id` → Phase 7B / Task 7B.4 |
+| §10 Audit log | Phase 2; new pact_* event kinds populated by Phase 7B + 8.8 + 8.9 |
 | §11 Multisig | Phase 10 + 11 |
 | §12 Dashboard | Phase 12 |
-| §13 MCP tools | Phase 9 |
-| §14 CLI surface | Phase 8 (init/status/audit/policy/pending/approve/reject/daemon) + Phase 11 (multisig sub-cmds) |
-| §15 Storage | Phase 1 |
-| §16 Data flows | Tested via wallet façade unit tests in Phase 7; full integration in 14.1 |
-| §17 Testing strategy | Tests embedded in every phase |
-| §18 Tech stack | Phase 0 + per-package package.json |
-| §19 Repo layout | File structure section |
-| §20 Trade-offs | Phase 13 / Task 13.3 |
-| §22 v1 vs Future | Phase 13 / Task 13.3 |
+| §13 MCP tools | Phase 9 (incl. list_pacts/get_pact/propose_tx pact_id) |
+| §14 CLI surface | Phase 8 (init/status/audit/policy/pending/approve/reject/daemon/pact) + Phase 11 (multisig sub-cmds) |
+| §15 Storage | Phase 1 (pacts table added in 1.4 schema) |
+| §16 Data flows | Tested via wallet façade unit tests in Phase 7 + 7B; full integration in 14.1 |
+| §17 Pact | Phase 7B (core), 8.8 + 8.9 (CLI), 9 (MCP), 13.3 (architecture doc) |
+| §18 Testing strategy | Tests embedded in every phase |
+| §19 Tech stack | Phase 0 + per-package package.json |
+| §20 Repo layout | File structure section |
+| §21 Trade-offs | Phase 13 / Task 13.3 |
+| §22 Open questions | Phase 13 / Task 13.3 (mentioned) |
+| §23 v1 vs Future | Phase 13 / Task 13.3 |
 
 No gaps.
 
 **Placeholder scan:** No "TBD", "TODO", or "implement later" markers in the plan. The only "stub" is `aiwallet daemon status` which is explicitly documented as a stub for v1 with audit log being the supported alternative — acceptable scope decision.
 
 **Type consistency:**
-- `EthAddress`, `Hex`, `WeiString`, `ProposedTx`, `PolicyVerdict`, `RiskReport`, `AuditEntry`, `PendingOp`, `PendingStatus`, `AuditEventKind` — all defined in Phase 1.2 and used consistently in 2, 4, 6, 7, 8, 9.
+- `EthAddress`, `Hex`, `WeiString`, `ProposedTx`, `PolicyVerdict`, `RiskReport`, `AuditEntry`, `PendingOp`, `PendingStatus`, `AuditEventKind`, `Pact`, `PactStatus`, `PactPolicyOverride` — all defined in Phase 1.2 / 7B.1 and used consistently in 2, 4, 6, 7, 7B, 8, 9.
 - `ChainClient` interface defined in 5.1, mocked in 5.1, implemented in `EthersChainClient`. CLI/daemon both consume `EthersChainClient` and methods used (`broadcastRaw`, `getNonce`, `getBalance`, `getCode`, `call`, `estimateGas`, `getChainId`) all match.
 - `AuditLog.append`, `query`, `verify`, `headHash` are stable across all consumers.
-- `PendingQueue.enqueue`, `get`, `list`, `reject`, `markBroadcast`, `expireDue` consistent.
-- `Wallet.propose` consistent.
-- Audit event kinds used in `wallet.ts`, `approve.ts`, `daemon.ts`, `multisig.ts` (`broadcast` kind reused for multisig with `via: "multisig"` payload field — consistent).
+- `PendingQueue.enqueue`, `get`, `list`, `reject`, `markBroadcast`, `expireDue` consistent. `EnqueueArgs` extended in 7B.4 to include optional `pactId`; `PendingOp` gains `pactId?` field at the same time.
+- `PactManager.create`, `get`, `list`, `consume`, `revoke`, `expireDue` consistent across CLI 8.8 / 8.9, MCP 9.9–9.11, and Wallet façade 7B.4.
+- `Wallet.propose(tx, pactId?)` signature consistent across MCP `propose_tx` and Wallet façade in 7B.4.
+- Audit event kinds used in `wallet.ts`, `approve.ts`, `daemon.ts`, `multisig.ts`, `pact.ts` (`broadcast` kind reused for multisig with `via: "multisig"` payload field; `pact_consume` / `pact_complete` emitted in 8.9 — all consistent).
 
-**Scope check:** The plan is large (5 packages) but each phase is independently testable and produces a working slice. No mid-plan re-scoping needed.
+**Scope check:** The plan is large (5 packages + Pact module) but each phase is independently testable and produces a working slice. No mid-plan re-scoping needed.
 
 ---
 
