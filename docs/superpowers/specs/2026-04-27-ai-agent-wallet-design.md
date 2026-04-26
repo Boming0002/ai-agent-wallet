@@ -43,6 +43,7 @@ A human (developer, trader, ops engineer, treasury manager) who delegates on-cha
 | S4 | Agent proposes a tx that fails simulation (would revert, or transfers token Agent doesn't own) | Demonstrates pre-flight risk catch; Agent receives diagnostic instead of broadcasting a doomed tx |
 | S5 | Operator wakes up and reviews `aiwallet audit`, sees a tamper-evident log of every Agent decision | Demonstrates after-the-fact accountability |
 | S6 | Treasury operation requires 2-of-3 signers (Agent + Owner + Recovery) via on-chain multisig | Demonstrates the Solidity contract path for high-stakes flows |
+| S7 | Operator scopes a delegated task — "Agent can pay supplier X up to 1000 USDC over 3 days, max 5 transactions, then expire" — and walks away | Demonstrates **Pact**: task-scoped authorization with explicit completion conditions, the abstraction that distinguishes an AI Agent wallet from a permissioned EOA |
 
 ---
 
@@ -60,6 +61,7 @@ A human (developer, trader, ops engineer, treasury manager) who delegates on-cha
 - G8. Ship a read-only Web Dashboard for visualizing pending operations, audit trail, and policy state.
 - G9. Provide a one-command e2e demo script that exercises the golden path end-to-end against a local fork or Sepolia.
 - G10. Deliver four required design documents (personas, problems, architecture, AI collaboration log) plus a quickstart README.
+- G11. Implement **Pacts** — task-scoped, time-bounded, budget-bounded authorization objects. A Pact bundles a free-text intent, a policy override (narrower than the global policy), and explicit completion conditions (deadline / max total spend / max op count). Every transaction may be proposed under a Pact; if the Pact is exhausted or expired the proposal is denied automatically. (See §17.)
 
 ### Non-Goals (explicit YAGNI)
 
@@ -290,6 +292,17 @@ Evaluation order (first match wins for `deny`; `auto_approve` only if no deny ap
 
 The audit log is the source of truth. On each evaluation, we sum the `value` field of every audit entry of kind `broadcast` whose `ts` falls in the current UTC day, and compare `today_outflow + value` to `dailyMaxWei`. No separate counter file (avoids drift / sync bugs). Pending (un-broadcast) operations are not counted; the next operation may still hit the cap and be denied.
 
+### 7.4 Pact-scoped policy override
+
+When a transaction is proposed under a Pact (§17), the engine evaluates against **two policy layers** and a proposal must pass both. The Pact's policy is a strict narrowing — it can shrink the allowlist, lower the per-tx max, or lower the auto-approve max, but never widen any of these relative to the global policy. The intersection rules:
+
+- `addressAllowlist`: effective list = `pactAllowlist ∩ globalAllowlist` if both non-empty; if global is empty, Pact's list is the effective list. (Empty global means "no allowlist constraint"; we still want Pact to constrain.)
+- `perTxMaxWei` / `autoApproveMaxWei`: `min(pact, global)`.
+- `addressDenylist`: union (anything denied by either layer is denied).
+- `dailyMaxWei`: global only — Pact has its own `maxTotalValueWei` instead (§17.2).
+
+A Pact also enforces its own completion conditions (deadline, total spent, op count) checked **before** policy evaluation; failing any of these returns `deny`.
+
 ---
 
 ## 8. Risk Module
@@ -403,8 +416,13 @@ Canonical JSON: keys sorted lexicographically, no whitespace, numbers as strings
 | `enqueue_hitl` | `op_id`, `expires_at` |
 | `owner_approve` / `owner_reject` | `op_id`, `reason?` |
 | `expire` | `op_id` |
-| `broadcast` | `op_id`, `tx_hash`, `value` (the wei amount; daily-cap accounting reads this field) |
+| `broadcast` | `op_id`, `tx_hash`, `value`, `pact_id?` (the wei amount; daily-cap accounting reads this field) |
 | `confirmed` | `op_id`, `tx_hash`, `block_number` |
+| `pact_create` | `pact_id`, `name`, `intent`, `policy`, `completionConditions` |
+| `pact_consume` | `pact_id`, `op_id`, `value`, `newSpent`, `newOpCount` |
+| `pact_complete` | `pact_id`, `reason` (`budget_exhausted` \| `op_count_reached`) |
+| `pact_expire` | `pact_id` |
+| `pact_revoke` | `pact_id`, `reason?` |
 
 ---
 
@@ -474,15 +492,17 @@ No mutation endpoints. Dashboard imports nothing from `keystore/`. This is enfor
 | `get_balance` | Native ETH and (optional) ERC-20 token balances | none |
 | `get_policy` | Returns current policy as JSON | none |
 | `simulate_tx` | Run risk + simulate, return `RiskReport`, no signing | none |
-| `propose_tx` | Run policy + risk; auto-broadcast or enqueue | may broadcast or enqueue |
+| `propose_tx` | Run policy + risk; auto-broadcast or enqueue. Accepts optional `pact_id` to scope the proposal under a Pact (§17). | may enqueue |
 | `list_pending` | Enumerate pending ops | none |
 | `query_audit` | Paginated audit log + chain head hash | none |
+| `list_pacts` | Enumerate Pacts (filterable by status) | none |
+| `get_pact` | Single Pact detail incl. spent/opCount/timeRemaining | none |
 | `multisig_status` | Pending op state in the multisig contract | none |
 | `multisig_propose` | Create off-chain op + signature for the multisig | enqueues |
 | `multisig_sign` | Add a signature to an existing multisig op | mutates |
 | `multisig_execute` | Submit op + signatures on-chain | broadcasts |
 
-The MCP server does **not** expose `set_policy`, `approve_pending`, or any mutator that grants funds-moving authority. Those live exclusively in the CLI.
+The MCP server does **not** expose `set_policy`, `approve_pending`, `pact create`, `pact revoke`, or any mutator that grants funds-moving authority. Those live exclusively in the CLI. The Agent can *propose under* a Pact, but cannot *create or modify* one.
 
 ---
 
@@ -498,6 +518,10 @@ The MCP server does **not** expose `set_policy`, `approve_pending`, or any mutat
 | `aiwallet approve <op_id>` | Approve a pending op (passphrase-gated) |
 | `aiwallet reject <op_id> [--reason]` | Reject a pending op |
 | `aiwallet daemon start [--foreground]` / `daemon stop` / `daemon status` | Run/stop the auto-approve daemon |
+| `aiwallet pact create --name <s> --intent <s> --policy <file> --expires <dur> --max-budget <wei> [--max-ops <n>]` | Create a new Pact |
+| `aiwallet pact list [--status active\|completed\|expired\|revoked]` | List Pacts |
+| `aiwallet pact show <pact_id>` | Inspect a Pact (intent, policy, conditions, progress) |
+| `aiwallet pact revoke <pact_id> [--reason]` | Manually revoke an active Pact |
 | `aiwallet multisig deploy / propose / sign / execute / status` | Drive the on-chain multisig |
 
 ---
@@ -513,7 +537,7 @@ Default `~/.ai-agent-wallet/`, override via `--data-dir` or `AI_WALLET_DATA_DIR`
 ├── agent_share.enc      # AES-256-GCM(scrypt(passphrase))
 ├── owner_share.enc
 ├── policy.json
-├── wallet.sqlite        # pending_ops + audit_log
+├── wallet.sqlite        # pending_ops + audit_log + pacts
 └── addresses.json       # { address, chainId, contractMultisigAddress? }
 ```
 
@@ -565,7 +589,149 @@ If at any point in 5–7 the operation no longer passes (e.g., daily cap now exc
 
 ---
 
-## 17. Testing Strategy
+## 17. Pact — Task-Scoped Authorization
+
+This is the highest-level authorization primitive in the wallet, layered on top of policy + risk + approval. A Pact represents a **delegated task** the Owner has approved the Agent to carry out, with explicit boundaries that make the delegation safe to grant and forget.
+
+### 17.1 What a Pact is
+
+A Pact is a persistent record with these fields:
+
+```ts
+interface Pact {
+  id: string;                          // ULID-like, 16 chars
+  name: string;                        // human label, e.g. "supplier-X-q1-2026"
+  intent: string;                      // free-text description of the task
+  policy: PactPolicyOverride;          // narrowing of global policy
+  completionConditions: {
+    expiresAt: number;                 // unix ms; mandatory
+    maxTotalValueWei: string;          // budget cap
+    maxOpCount?: number;               // optional cap on operation count
+  };
+  spentWei: string;                    // cumulative successful broadcast value
+  opCount: number;                     // cumulative successful broadcasts
+  status: "active" | "completed" | "expired" | "revoked";
+  createdAt: number;
+  decidedAt?: number;                  // when status moved away from active
+  decidedBy?: "system_complete" | "system_expire" | "owner_revoke";
+}
+
+interface PactPolicyOverride {
+  // Subset of fields from Policy. All optional. Each, if present, narrows the global.
+  perTxMaxWei?: string;
+  autoApproveMaxWei?: string;
+  addressAllowlist?: string[];         // intersected with global if both non-empty
+  addressDenylist?: string[];          // unioned with global
+  contractMethodAllowlist?: { address: string; selector: string }[];
+}
+```
+
+### 17.2 Why Pacts (vs raw policy alone)
+
+A global policy answers "what is the Agent allowed to do *in general*?" A Pact answers "what is the Agent allowed to do *for this specific task, until when, up to how much*?" The latter is the actual mental model of delegation: Owner is rarely thinking "permanently grant Agent the ability to send up to 0.1 ETH per tx forever"; they're thinking "let Agent pay this supplier for the next three days, up to a budget, then revoke automatically." Pacts encode that mental model directly.
+
+This also makes the security trade-off legible: a wider `perTxMax` is much safer if it lives only inside a 2-day, 1000-USDC Pact than if it lives in the global policy file.
+
+### 17.3 Lifecycle
+
+```
+            create
+              │
+              v
+      +---------------+
+      |    active     |
+      +---+---+---+---+
+          |   |   |   |
+   budget |   |   |   | (never)
+   exhaust|   |   |   |
+          v   |   |   |
+   +-----------+   |   |
+   | completed |   |   |
+   +-----------+   |   |
+                   |   |
+   op_count >= max |   |
+                   v   |
+           +-----------+
+           | completed |
+           +-----------+
+                       |
+       expiresAt <= now|
+                       v
+               +-----------+
+               |  expired  |
+               +-----------+
+
+   any active state + owner explicit:
+                  +----------+
+                  | revoked  |
+                  +----------+
+```
+
+Status transitions are checked **lazily** on every relevant operation (propose, list, show). A pact with `status='active'` but `expiresAt <= now()` is treated as expired for evaluation purposes and is updated to `status='expired'` on the next observation.
+
+### 17.4 Proposal flow under a Pact
+
+1. Agent calls `propose_tx({pact_id, to, value, data})`.
+2. Wallet loads the Pact. If missing → deny `pact_not_found`.
+3. Lazy expire check: if `expiresAt <= now`, mark expired, deny.
+4. Status check: if not `active`, deny.
+5. Budget check: if `spentWei + value > maxTotalValueWei`, deny.
+6. Op count check: if `maxOpCount` set and `opCount + 1 > maxOpCount`, deny.
+7. Compute the merged policy (Pact ∩ global per §7.4) and run normal `evaluatePolicy`.
+8. Run normal `assessRisk`.
+9. If verdict is `auto_approve` or `require_hitl`, enqueue and write `propose` audit entry with `pact_id` payload.
+10. On successful **broadcast** (CLI `approve` or daemon), write `broadcast` audit entry with `pact_id`, then atomically:
+    - Update Pact's `spentWei += value` and `opCount += 1`.
+    - Append `pact_consume` audit entry.
+    - If post-update `spentWei >= maxTotalValueWei` OR `opCount >= maxOpCount`, set Pact to `completed` and append `pact_complete` audit entry.
+
+### 17.5 SQLite schema (table `pacts`)
+
+```sql
+CREATE TABLE pacts (
+  id TEXT PRIMARY KEY,                  -- 16-char ULID
+  name TEXT NOT NULL,
+  intent TEXT NOT NULL,
+  policy_override_json TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  max_total_value_wei TEXT NOT NULL,
+  max_op_count INTEGER,
+  spent_wei TEXT NOT NULL DEFAULT '0',
+  op_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  decided_by TEXT
+);
+CREATE INDEX idx_pacts_status ON pacts(status, expires_at);
+```
+
+### 17.6 Pact + Audit interplay
+
+Every Pact lifecycle event lands in the audit log (kinds added in §10.3). Pact spend is reconcilable two independent ways:
+- Sum of `pact_consume.value` for that `pact_id` should equal `pacts.spent_wei`.
+- Sum of `broadcast.value` where `broadcast.pact_id == X` should equal `pacts.spent_wei`.
+
+These two sums must agree; the `audit verify` command optionally cross-checks (`--check-pacts`).
+
+### 17.7 What a Pact is NOT (in v1)
+
+- Not an on-chain object. No Solidity, no signed Pact attestation. Pacts are off-chain wallet records.
+- Not multi-Agent: each Pact authorizes one Agent identity (the wallet's MPC EOA). Multi-Agent Pacts are future work.
+- Not transferable / assignable: revoke + recreate.
+- No `executionPlan` field (Cobo's framing). For v1 we ship the *constraint* half of the Pact framework (policy + completion conditions), not the *plan* half (a structured DAG of intended actions). The Agent's actual sequence of `propose_tx` calls is what executes the intent; the Pact's role is to constrain.
+
+### 17.8 Defaults and ergonomics
+
+- A Pact must specify `expiresAt`. Indefinite Pacts are disallowed.
+- A Pact must specify `maxTotalValueWei`. Unlimited budget Pacts are disallowed.
+- `maxOpCount` is optional; if omitted, only the budget gates op count.
+- Creating a Pact with policy override looser than the global is a CLI error (the override is a narrowing).
+- The CLI prints the Pact's `id` and a summary line on creation; that line is what the Owner copy-pastes to the Agent.
+
+---
+
+## 18. Testing Strategy
 
 ### 17.1 Unit (vitest, per-module)
 
@@ -592,7 +758,7 @@ If at any point in 5–7 the operation no longer passes (e.g., daily cap now exc
 
 ---
 
-## 18. Tech Stack Summary
+## 19. Tech Stack Summary
 
 | Layer | Choice | Reason |
 |---|---|---|
@@ -613,7 +779,7 @@ If at any point in 5–7 the operation no longer passes (e.g., daily cap now exc
 
 ---
 
-## 19. Repository Layout
+## 20. Repository Layout
 
 ```
 ai-agent-wallet/
@@ -664,7 +830,7 @@ ai-agent-wallet/
 
 ---
 
-## 20. Key Engineering Trade-offs (To Document Honestly)
+## 21. Key Engineering Trade-offs (To Document Honestly)
 
 1. **MPC simulation, not real TSS.** Demo-level. Threat-model story holds; cryptography story is explicitly instructional.
 2. **Auto-approve requires daemon process.** Owner must run an authenticated long-lived process to enable unattended low-value automation. Default mode is full HITL.
@@ -676,7 +842,7 @@ ai-agent-wallet/
 
 ---
 
-## 21. Open Questions / Risks
+## 22. Open Questions / Risks
 
 - **Hardhat Sepolia verify reliability.** Sometimes flaky. Mitigation: include both Hardhat verify and a sourcify fallback.
 - **MCP SDK API churn.** The MCP TypeScript SDK has evolved; pin to a known-good version.
@@ -685,24 +851,43 @@ ai-agent-wallet/
 
 ---
 
-## 22. What Ships in v1 vs Future Work
+## 23. What Ships in v1 vs Future Work
 
 ### v1 (this submission)
 
-- Everything above marked as Goal.
+- Everything above marked as Goal (G1–G11).
 - All four required documents.
 - Verified Sepolia contract.
 - Working dashboard.
 - E2E demo script.
 - README quickstart.
+- Working Pact lifecycle (create / consume / complete / expire / revoke) end-to-end.
 
-### Future work (mentioned in architecture doc, not built)
+### Future work
 
-- Real TSS (GG18 / CMP / DKG-based MP-ECDSA).
-- Hardware wallet for `s_owner` (e.g., signer integration via WebHID/USB HID).
-- Mnemonic-based recovery & key rotation (`aiwallet recover` would re-import from a written-down backup or apply a recovery-key-signed rotation tx).
-- Multi-chain (EVM L2s first, then non-EVM).
-- DEX integration with policy-aware slippage rules.
-- Programmable policy DSL (currently JSON).
+The features below are deliberately deferred. Several of them are in scope for production-grade AI Agent wallet platforms (Cobo's published Agentic Wallet is a relevant reference); we surface them here as the natural follow-on roadmap rather than implementing fragments.
+
+**Pact extensions:**
+- `executionPlan` (the second half of the Cobo-style Pact framework): a structured, ordered list of intended actions the Agent commits to follow. v1 ships only the *constraint* half (policy + completion conditions); v2 would add the plan half plus a runtime checker that flags Agent deviations from the declared plan.
+- Multi-Agent Pacts (one Pact authorizes a team of Agents with role-typed sub-quotas).
+- On-chain Pact attestations (signed Pact digest published to a bulletin-board contract for external auditors).
+- Pact templates / Recipes — pre-canned Pact bodies for common tasks (token transfer with allowlist, recurring payment, DCA), aligned with Cobo's Recipes concept.
+
+**Cryptography & key management:**
+- Real TSS (GG18 / CMP / DKG-based MP-ECDSA) — replace the demo Shamir simulation; private key never reconstructed.
+- Two-group MPC architecture (Agent+Service / Human+Service) — closer to Cobo's deployed model where the wallet provider is an unavoidable third party in both signing groups.
+- Hardware wallet for `s_owner` (signer integration via WebHID / USB HID / Ledger).
+- Mnemonic-based recovery & key rotation.
+
+**Reach:**
+- Multi-chain (EVM L2s first, then Solana, BTC). Cobo claims 80+ chains; for a real product this is table stakes.
+- Multi-framework SDK adapters: native LangChain / OpenAI Agents / CrewAI / Agno integrations beyond MCP. The MCP-first choice is correct for a demo but a production product needs the breadth.
+- Skill-based install protocol (e.g. `npx skills add ai-agent-wallet`) so MCP-aware agents can discover and install the wallet without manual config edits.
+- Mobile (iOS + Android) approval app for the Owner. The CLI is the right v1 surface; a long-running product needs a phone push-notification flow for HITL approvals.
+
+**Operations & observability:**
+- DEX / DeFi protocol-aware risk plugins (Uniswap V3 slippage, Aave health-factor checks, Compound utilization).
+- Real-time progress dashboard widgets (Cobo-style "USD spent / time remaining" cards per active Pact).
 - Signed audit-log attestations published to a public bulletin board for external verification.
-- Mobile push notifications for pending ops.
+- Programmable policy DSL (currently JSON-only).
+- Push-notification channels for pending ops (Slack / Telegram / email / mobile).
