@@ -48,7 +48,11 @@ export type AuditEventKind =
   | "owner_reject"
   | "expire"
   | "broadcast"
-  | "confirmed";
+  | "confirmed"
+  | "pact_create"
+  | "pact_consume"
+  | "pact_complete"
+  | "pact_revoke";
 
 export interface AuditEntry {
   seq: number;
