@@ -10,6 +10,7 @@ import { registerApprove } from "./commands/approve.js";
 import { registerReject } from "./commands/reject.js";
 import { registerDaemon } from "./commands/daemon.js";
 import { registerPact } from "./commands/pact.js";
+import { registerMultisig } from "./commands/multisig.js";
 
 const program = new Command()
   .name("aiwallet")
@@ -25,5 +26,6 @@ registerApprove(program);
 registerReject(program);
 registerDaemon(program);
 registerPact(program);
+registerMultisig(program);
 
 program.parseAsync(process.argv);
