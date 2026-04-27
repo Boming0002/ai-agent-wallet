@@ -30,13 +30,13 @@ A significant scope debate happened here. The original brief gestured at Tier 3 
 
 ### Phase 2: Spec Writing
 
-The spec was written collaboratively. The AI drafted sections based on the brainstorm output; the human reviewed, corrected, and approved each section before the AI continued. The final spec (`docs/superpowers/specs/2026-04-27-ai-agent-wallet-design.md`) went through a self-review pass for: missing placeholder text, internal contradictions (e.g., references to features that were descoped), ambiguous API contracts, and anything that would make the implementation plan ambiguous.
+The spec was written collaboratively. The AI drafted sections based on the brainstorm output; the human reviewed, corrected, and approved each section before the AI continued. The final ~900-line design spec went through a self-review pass for: missing placeholder text, internal contradictions (e.g., references to features that were descoped), ambiguous API contracts, and anything that would make the implementation plan ambiguous.
 
 The spec explicitly documented the MPC simulation honestly, the dashboard read-only constraint, and the daemon's security trade-off. These are not footnotes — they are prominent design decisions that the implementation had to respect.
 
 ### Phase 3: Implementation Plan
 
-The `writing-plans` skill converted the approved spec into this project's plan file (`docs/superpowers/plans/2026-04-27-ai-agent-wallet.md`). The plan has 14 phases, each broken into tasks, each task into numbered steps, each step into a git commit with an exact commit message. The granularity was deliberate: it allows a sub-agent to execute one task with a clear success criterion, without needing to interpret intent.
+The `writing-plans` skill converted the approved spec into a detailed implementation plan (~5500 lines). The plan has 14 phases, each broken into tasks, each task into numbered steps, each step into a git commit with an exact commit message. The granularity was deliberate: it allows a sub-agent to execute one task with a clear success criterion, without needing to interpret intent.
 
 The plan itself went through a self-review pass: does every task reference the right file paths? Does the test setup happen before the code it tests? Are there any circular dependencies in the build order? Are any spec promises not represented in the plan?
 

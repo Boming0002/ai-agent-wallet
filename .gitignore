@@ -17,3 +17,6 @@ data/
 packages/contracts/artifacts/
 packages/contracts/cache/
 packages/contracts/typechain-types/
+
+# Internal planning artifacts (kept out of public repo)
+docs/superpowers/
