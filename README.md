@@ -21,6 +21,57 @@ The wallet exposes itself through three surfaces:
 
 It also ships a Solidity 2-of-3 multisig contract (`AIAgentMultisig`) for treasury flows.
 
+## Architecture at a glance
+
+```mermaid
+flowchart TB
+  subgraph Surfaces["Integration surfaces"]
+    direction LR
+    CLI["aiwallet CLI<br/>Owner — holds s_owner only on demand"]
+    MCP["MCP Server<br/>AI Agent — holds s_agent in memory"]
+    DASH["Web Dashboard<br/>read-only"]
+  end
+
+  subgraph Core["packages/core"]
+    direction LR
+    KEY["keystore<br/>MPC Shamir 2-of-2"]
+    POL["policy<br/>rule engine"]
+    RISK["risk<br/>pre-flight checks"]
+    APPR["approval<br/>HITL queue"]
+    PACT["pact<br/>task-scoped auth"]
+    AUDIT["audit<br/>hash-chain log"]
+  end
+
+  subgraph Storage["Local storage"]
+    SQL[("SQLite WAL<br/>pending / audit / pacts")]
+    KS[("encrypted shares<br/>scrypt + AES-256-GCM")]
+  end
+
+  CHAIN["Sepolia RPC<br/>(ethers v6)"]
+  MS["AIAgentMultisig.sol<br/>2-of-3 on-chain"]
+
+  CLI --> Core
+  MCP --> Core
+  DASH --> SQL
+  Core --> Storage
+  Core --> CHAIN
+  CLI --> MS
+```
+
+Trust boundary: the MCP process is treated as untrusted (Agent instructions flow through it) and never holds `s_owner`. All signing happens inside the CLI process.
+
+## Where to look first
+
+Recommended reading order for a quick review:
+
+1. **[`docs/02-key-problems.md`](docs/02-key-problems.md)** — the three problems and how the wallet solves each.
+2. **[`docs/03-architecture.md`](docs/03-architecture.md)** — modules, trust boundaries, threat model, hash-chain spec.
+3. **[`packages/core/src/wallet.ts`](packages/core/src/wallet.ts)** — wallet façade tying every module together.
+4. **[`packages/core/src/keystore/keystore.ts`](packages/core/src/keystore/keystore.ts)** — MPC sharding (with the demo-simulation banner).
+5. **[`packages/core/src/pact/manager.ts`](packages/core/src/pact/manager.ts)** — task-scoped authorization (the differentiating abstraction).
+6. **[`packages/contracts/contracts/AIAgentMultisig.sol`](packages/contracts/contracts/AIAgentMultisig.sol)** — ~150-line 2-of-3 multisig, written from scratch.
+7. **[`scripts/e2e-demo.ts`](scripts/e2e-demo.ts)** — runs offline; exercises auto / HITL / deny end-to-end via `pnpm demo`.
+
 ## Submission docs
 
 - [`docs/01-personas-and-scenarios.md`](docs/01-personas-and-scenarios.md) — Personas and use cases
