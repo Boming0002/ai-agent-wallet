@@ -1,5 +1,11 @@
 # AI Agent Wallet
 
+> **License — Evaluation Only.** This repository is provided to a prospective
+> employer solely for evaluating the author's work during a recruitment process.
+> Commercial use, production deployment, redistribution, and derivative works
+> are not permitted without the author's written consent. See
+> [LICENSE.md](LICENSE.md) for full terms.
+
 A purpose-built Ethereum (Sepolia) wallet for autonomous AI Agents. Designed
 around three problems unique to AI operators:
 
