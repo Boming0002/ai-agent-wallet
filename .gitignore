@@ -12,3 +12,8 @@ data/
 *.sqlite-journal
 *_share.enc
 .ai-agent-wallet/
+
+# Hardhat compile outputs
+packages/contracts/artifacts/
+packages/contracts/cache/
+packages/contracts/typechain-types/
