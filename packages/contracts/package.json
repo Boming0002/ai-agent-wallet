@@ -1,0 +1,22 @@
+{
+  "name": "@ai-agent-wallet/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:sepolia": "hardhat run scripts/deploy.ts --network sepolia",
+    "verify": "hardhat verify --network sepolia"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox-viem": "^3.0.0",
+    "@nomicfoundation/hardhat-verify": "^2.0.0",
+    "@types/chai": "^4.3.0",
+    "chai": "^4.4.1",
+    "hardhat": "^2.22.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "viem": "^2.21.0"
+  }
+}
